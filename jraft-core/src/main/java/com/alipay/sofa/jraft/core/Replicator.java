@@ -618,6 +618,11 @@ public class Replicator implements ThreadId.OnError {
             return;
         }
         boolean doUnlock = true;
+        if (!this.rpcService.connect(this.options.getPeerId().getEndpoint())) {
+            LOG.error("Fail to check install snapshot connection to peer={}, give up to send install snapshot request.", this.options.getPeerId().getEndpoint());
+            block(Utils.nowMs(), RaftError.EHOSTDOWN.getNumber());
+            return;
+        }
         try {
             Requires.requireTrue(this.reader == null,
                 "Replicator %s already has a snapshot reader, current state is %s", this.options.getPeerId(),
@@ -905,7 +910,7 @@ public class Replicator implements ThreadId.OnError {
         r.lastRpcSendTimestamp = Utils.monotonicMs();
         r.startHeartbeatTimer(Utils.nowMs());
         // id.unlock in sendEmptyEntries
-        r.sendEmptyEntries(false);
+        r.sendProbeRequest();
         return r.id;
     }
 
@@ -989,7 +994,7 @@ public class Replicator implements ThreadId.OnError {
             // _next_index otherwise the replicator is likely waits in            executor.shutdown();
             // _wait_more_entries and no further logs would be replicated even if the
             // last_index of this followers is less than |next_index - 1|
-            r.sendEmptyEntries(false);
+            r.sendProbeRequest();
         } else if (errCode != RaftError.ESTOP.getNumber()) {
             // id is unlock in _send_entries
             r.sendEntries();
@@ -1026,7 +1031,7 @@ public class Replicator implements ThreadId.OnError {
             this.blockTimer = null;
             LOG.error("Fail to add timer", e);
             // id unlock in sendEmptyEntries.
-            sendEmptyEntries(false);
+            sendProbeRequest();
         }
     }
 
@@ -1068,10 +1073,8 @@ public class Replicator implements ThreadId.OnError {
                 r.destroy();
             }
         } else if (errorCode == RaftError.ETIMEDOUT.getNumber()) {
-            id.unlock();
             RpcUtils.runInThread(() -> sendHeartbeat(id));
         } else {
-            id.unlock();
             // noinspection ConstantConditions
             Requires.requireTrue(false, "Unknown error code for replicator: " + errorCode);
         }
@@ -1221,7 +1224,7 @@ public class Replicator implements ThreadId.OnError {
                 }
                 LOG.warn("Heartbeat to peer {} failure, try to send a probe request.", r.options.getPeerId());
                 doUnlock = false;
-                r.sendEmptyEntries(false);
+                r.sendProbeRequest();
                 r.startHeartbeatTimer(startTimeMs);
                 return;
             }
@@ -1267,7 +1270,7 @@ public class Replicator implements ThreadId.OnError {
                 holdingQueue.size(), r.options.getPeerId(), r.raftOptions.getMaxReplicatorInflightMsgs());
             r.resetInflights();
             r.setState(State.Probe);
-            r.sendEmptyEntries(false);
+            r.sendProbeRequest();
             return;
         }
 
@@ -1383,7 +1386,7 @@ public class Replicator implements ThreadId.OnError {
             r.resetInflights();
             r.setState(State.Probe);
             // unlock id in sendEmptyEntries
-            r.sendEmptyEntries(false);
+            r.sendProbeRequest();
             return false;
         }
         // record metrics
@@ -1433,6 +1436,20 @@ public class Replicator implements ThreadId.OnError {
         }
         r.consecutiveErrorTimes = 0;
         if (!response.getSuccess()) {
+             // Target node is is busy, sleep for a while.
+            if(response.getErrorResponse().getErrorCode() == RaftError.EBUSY.getNumber()) {
+              if (isLogDebugEnabled) {
+                sb.append(" is busy, sleep, errorMsg='") //
+                    .append(response.getErrorResponse().getErrorMsg()).append("'");
+                LOG.debug(sb.toString());
+              }
+              r.resetInflights();
+              r.setState(State.Probe);
+              // unlock in in block
+              r.block(startTimeMs, status.getCode());
+              return false;
+            }
+
             if (response.getTerm() > r.options.getTerm()) {
                 if (isLogDebugEnabled) {
                     sb.append(" fail, greater term ") //
@@ -1475,7 +1492,7 @@ public class Replicator implements ThreadId.OnError {
                 }
             }
             // dummy_id is unlock in _send_heartbeat
-            r.sendEmptyEntries(false);
+            r.sendProbeRequest();
             return false;
         }
         if (isLogDebugEnabled) {
@@ -1690,6 +1707,10 @@ public class Replicator implements ThreadId.OnError {
         }
         // unlock in sendEmptyEntries
         r.sendEmptyEntries(true);
+    }
+
+    private void sendProbeRequest() {
+        sendEmptyEntries(false);
     }
 
     @SuppressWarnings("SameParameterValue")
