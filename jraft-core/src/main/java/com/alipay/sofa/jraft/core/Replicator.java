@@ -54,6 +54,7 @@ import com.alipay.sofa.jraft.rpc.RpcResponseClosure;
 import com.alipay.sofa.jraft.rpc.RpcResponseClosureAdapter;
 import com.alipay.sofa.jraft.rpc.RpcUtils;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotReader;
+import com.alipay.sofa.jraft.util.BufferUtils;
 import com.alipay.sofa.jraft.util.ByteBufferCollector;
 import com.alipay.sofa.jraft.util.OnlyForTest;
 import com.alipay.sofa.jraft.util.Recyclable;
@@ -61,6 +62,7 @@ import com.alipay.sofa.jraft.util.RecyclableByteBufferList;
 import com.alipay.sofa.jraft.util.RecycleUtil;
 import com.alipay.sofa.jraft.util.Requires;
 import com.alipay.sofa.jraft.util.ThreadId;
+import com.alipay.sofa.jraft.util.ThreadPoolsFactory;
 import com.alipay.sofa.jraft.util.Utils;
 import com.alipay.sofa.jraft.util.internal.ThrowUtil;
 import com.codahale.metrics.Gauge;
@@ -96,6 +98,7 @@ public class Replicator implements ThreadId.OnError {
     private volatile long                    probeCounter           = 0;
     private volatile long                    appendEntriesCounter   = 0;
     private volatile long                    installSnapshotCounter = 0;
+    private volatile long                    blockCounter           = 0;
     protected Stat                           statInfo               = new Stat();
     private ScheduledFuture<?>               blockTimer;
 
@@ -198,6 +201,7 @@ public class Replicator implements ThreadId.OnError {
             gauges.put("heartbeat-times", (Gauge<Long>) () -> this.r.heartbeatCounter);
             gauges.put("install-snapshot-times", (Gauge<Long>) () -> this.r.installSnapshotCounter);
             gauges.put("probe-times", (Gauge<Long>) () -> this.r.probeCounter);
+            gauges.put("block-times", (Gauge<Long>) () -> this.r.blockCounter);
             gauges.put("append-entries-times", (Gauge<Long>) () -> this.r.appendEntriesCounter);
             return gauges;
         }
@@ -713,7 +717,7 @@ public class Replicator implements ThreadId.OnError {
                 sb.append(" error:").append(status);
                 LOG.info(sb.toString());
                 notifyReplicatorStatusListener(r, ReplicatorEvent.ERROR, status);
-                if (++r.consecutiveErrorTimes % 10 == 0) {
+                if ((r.consecutiveErrorTimes++) % 10 == 0) {
                     LOG.warn("Fail to install snapshot at peer={}, error={}", r.options.getPeerId(), status);
                 }
                 success = false;
@@ -918,7 +922,7 @@ public class Replicator implements ThreadId.OnError {
         return "replicator-" + opts.getNode().getGroupId() + "/" + opts.getPeerId();
     }
 
-    public static void waitForCaughtUp(final ThreadId id, final long maxMargin, final long dueTime,
+    public static void waitForCaughtUp(final String groupId, final ThreadId id, final long maxMargin, final long dueTime,
                                        final CatchUpClosure done) {
         final Replicator r = (Replicator) id.lock();
 
@@ -929,7 +933,7 @@ public class Replicator implements ThreadId.OnError {
         try {
             if (r.catchUpClosure != null) {
                 LOG.error("Previous wait_for_caught_up is not over");
-                Utils.runClosureInThread(done, new Status(RaftError.EINVAL, "Duplicated call"));
+                ThreadPoolsFactory.runClosureInThread(groupId, done, new Status(RaftError.EINVAL, "Duplicated call"));
                 return;
             }
             done.setMaxMargin(maxMargin);
@@ -946,7 +950,7 @@ public class Replicator implements ThreadId.OnError {
     @Override
     public String toString() {
         return "Replicator [state=" + getState() + ", statInfo=" + this.statInfo + ", peerId="
-               + this.options.getPeerId() + ", type=" + this.options.getReplicatorType() + "]";
+               + this.options.getPeerId() + ", waitId=" + this.waitId + ", type=" + this.options.getReplicatorType() + "]";
     }
 
     static void onBlockTimeoutInNewThread(final ThreadId id) {
@@ -987,7 +991,7 @@ public class Replicator implements ThreadId.OnError {
         if (r == null) {
             return false;
         }
-        r.waitId = -1;
+        
         if (errCode == RaftError.ETIMEDOUT.getNumber()) {
             r.blockTimer = null;
             // Send empty entries after block timeout to check the correct
@@ -996,6 +1000,8 @@ public class Replicator implements ThreadId.OnError {
             // last_index of this followers is less than |next_index - 1|
             r.sendProbeRequest();
         } else if (errCode != RaftError.ESTOP.getNumber()) {
+        	// Only reset waitId before sending entries, fixed #842, #838
+        	r.waitId = -1;
             // id is unlock in _send_entries
             r.sendEntries();
         } else {
@@ -1020,6 +1026,7 @@ public class Replicator implements ThreadId.OnError {
             unlockId();
             return;
         }
+        this.blockCounter++;
         final long dueTime = startTimeMs + this.options.getDynamicHeartBeatTimeoutMs();
         try {
             LOG.debug("Blocking {} for {} ms", this.options.getPeerId(), this.options.getDynamicHeartBeatTimeoutMs());
@@ -1191,7 +1198,7 @@ public class Replicator implements ThreadId.OnError {
                 }
                 r.setState(State.Probe);
                 notifyReplicatorStatusListener(r, ReplicatorEvent.ERROR, status);
-                if (++r.consecutiveErrorTimes % 10 == 0) {
+                if ((r.consecutiveErrorTimes++) % 10 == 0) {
                     LOG.warn("Fail to issue RPC to {}, consecutiveErrorTimes={}, error={}", r.options.getPeerId(),
                         r.consecutiveErrorTimes, status);
                 }
@@ -1424,7 +1431,7 @@ public class Replicator implements ThreadId.OnError {
                 LOG.debug(sb.toString());
             }
             notifyReplicatorStatusListener(r, ReplicatorEvent.ERROR, status);
-            if (++r.consecutiveErrorTimes % 10 == 0) {
+            if ((r.consecutiveErrorTimes++) % 10 == 0) {
                 LOG.warn("Fail to issue RPC to {}, consecutiveErrorTimes={}, error={}", r.options.getPeerId(),
                     r.consecutiveErrorTimes, status);
             }
@@ -1643,7 +1650,7 @@ public class Replicator implements ThreadId.OnError {
                     dataBuf.put(b);
                 }
                 final ByteBuffer buf = dataBuf.getBuffer();
-                buf.flip();
+                BufferUtils.flip(buf);
                 rb.setData(ZeroByteStringHelper.wrap(buf));
             }
         } finally {

@@ -30,7 +30,7 @@ import com.alipay.sofa.jraft.util.Utils;
  * Node options.
  *
  * @author boyan (boyan@alibaba-inc.com)
- *
+ * @author lfyg
  * 2018-Apr-04 2:59:12 PM
  */
 public class NodeOptions extends RpcOptions implements Copiable<NodeOptions> {
@@ -103,6 +103,8 @@ public class NodeOptions extends RpcOptions implements Copiable<NodeOptions> {
 
     // Describe a specific SnapshotStorage in format ${type}://${parameters}
     private String                          snapshotUri;
+
+    private String                          snapshotTempUri;
 
     // If enable, we will filter duplicate files before copy remote snapshot,
     // to avoid useless transmission. Two files in local and remote are duplicate,
@@ -366,6 +368,14 @@ public class NodeOptions extends RpcOptions implements Copiable<NodeOptions> {
         this.snapshotUri = snapshotUri;
     }
 
+    public String getSnapshotTempUri() {
+        return snapshotTempUri;
+    }
+
+    public void setSnapshotTempUri(String snapshotTempUri) {
+        this.snapshotTempUri = snapshotTempUri;
+    }
+
     public boolean isFilterBeforeCopyRemote() {
         return this.filterBeforeCopyRemote;
     }
@@ -435,6 +445,14 @@ public class NodeOptions extends RpcOptions implements Copiable<NodeOptions> {
         nodeOptions.setSharedVoteTimer(this.sharedVoteTimer);
         nodeOptions.setSharedStepDownTimer(this.sharedStepDownTimer);
         nodeOptions.setSharedSnapshotTimer(this.sharedSnapshotTimer);
+
+        nodeOptions.setRpcConnectTimeoutMs(super.getRpcConnectTimeoutMs());
+        nodeOptions.setRpcDefaultTimeout(super.getRpcDefaultTimeout());
+        nodeOptions.setRpcInstallSnapshotTimeout(super.getRpcInstallSnapshotTimeout());
+        nodeOptions.setRpcProcessorThreadPoolSize(super.getRpcProcessorThreadPoolSize());
+        nodeOptions.setEnableRpcChecksum(super.isEnableRpcChecksum());
+        nodeOptions.setMetricRegistry(super.getMetricRegistry());
+
         return nodeOptions;
     }
 
