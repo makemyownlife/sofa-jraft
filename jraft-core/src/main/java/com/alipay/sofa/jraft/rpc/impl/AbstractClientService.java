@@ -107,7 +107,7 @@ public abstract class AbstractClientService implements ClientService {
         final RaftRpcFactory factory = RpcFactoryHelper.rpcFactory();
         this.rpcClient = factory.createRpcClient(factory.defaultJRaftClientConfigHelper(this.rpcOptions));
         configRpcClient(this.rpcClient);
-        this.rpcClient.init(null);
+        this.rpcClient.init(this.rpcOptions);
         this.rpcExecutor = ThreadPoolUtil.newBuilder() //
             .poolName("JRaft-RPC-Processor") //
             .enableMetric(true) //
@@ -120,7 +120,6 @@ public abstract class AbstractClientService implements ClientService {
         if (this.rpcOptions.getMetricRegistry() != null) {
             this.rpcOptions.getMetricRegistry().register("raft-rpc-client-thread-pool",
                 new ThreadPoolMetricSet(this.rpcExecutor));
-            Utils.registerClosureExecutorMetrics(this.rpcOptions.getMetricRegistry());
         }
         return true;
     }

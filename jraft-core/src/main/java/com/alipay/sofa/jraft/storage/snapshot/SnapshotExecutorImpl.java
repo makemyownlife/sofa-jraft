@@ -17,11 +17,14 @@
 package com.alipay.sofa.jraft.storage.snapshot;
 
 import java.io.IOException;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import com.alipay.sofa.jraft.option.NodeOptions;
+import com.alipay.sofa.jraft.util.ThreadPoolsFactory;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -138,7 +141,7 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
 
         @Override
         public void run(final Status status) {
-            Utils.runInThread(() -> continueRun(status));
+            ThreadPoolsFactory.runInThread(getNode().getGroupId(), () -> continueRun(status));
         }
 
         void continueRun(final Status st) {
@@ -147,13 +150,14 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
                 st.setError(ret, "node call onSnapshotSaveDone failed");
             }
             if (this.done != null) {
-                Utils.runClosureInThread(this.done, st);
+                ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), this.done, st);
             }
         }
 
         @Override
         public SnapshotWriter start(final SnapshotMeta meta) {
             this.meta = meta;
+            this.writer.setCurrentMeta(meta);
             return this.writer;
         }
     }
@@ -222,16 +226,18 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
 
     @Override
     public boolean init(final SnapshotExecutorOptions opts) {
-        if (StringUtils.isBlank(opts.getUri())) {
+        this.node = opts.getNode();
+        Objects.requireNonNull(this.node, "Node is null.");
+        NodeOptions nodeOptions = this.node.getOptions();
+        String snapshotUri = nodeOptions.getSnapshotUri();
+        if (StringUtils.isBlank(snapshotUri)) {
             LOG.error("Snapshot uri is empty.");
             return false;
         }
         this.logManager = opts.getLogManager();
         this.fsmCaller = opts.getFsmCaller();
-        this.node = opts.getNode();
         this.term = opts.getInitTerm();
-        this.snapshotStorage = this.node.getServiceFactory().createSnapshotStorage(opts.getUri(),
-            this.node.getRaftOptions());
+        this.snapshotStorage = this.node.getServiceFactory().createSnapshotStorage(nodeOptions);
         if (opts.isFilterBeforeCopyRemote()) {
             this.snapshotStorage.setFilterBeforeCopyRemote();
         }
@@ -255,7 +261,7 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
         }
         this.loadingSnapshotMeta = reader.load();
         if (this.loadingSnapshotMeta == null) {
-            LOG.error("Fail to load meta from {}.", opts.getUri());
+            LOG.error("Fail to load meta from {}.", snapshotUri);
             Utils.closeQuietly(reader);
             return false;
         }
@@ -274,7 +280,7 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
             Utils.closeQuietly(reader);
         }
         if (!done.status.isOk()) {
-            LOG.error("Fail to load snapshot from {}, FirstSnapshotLoadDone status is {}.", opts.getUri(), done.status);
+            LOG.error("Fail to load snapshot from {}, FirstSnapshotLoadDone status is {}.", snapshotUri, done.status);
             return false;
         }
         return true;
@@ -299,21 +305,40 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
     }
 
     @Override
-    public void doSnapshot(final Closure done) {
+    public void doSnapshot(Closure done) {
+        this.doSnapshot(done, false);
+    }
+
+    @Override
+    public void doSnapshotSync(Closure done) {
+        this.doSnapshot(done, true);
+    }
+
+    private void doSnapshot(final Closure done, boolean sync) {
         boolean doUnlock = true;
         this.lock.lock();
         try {
             if (this.stopped) {
-                Utils.runClosureInThread(done, new Status(RaftError.EPERM, "Is stopped."));
+                ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), done, new Status(RaftError.EPERM,
+                    "Is stopped."));
                 return;
             }
+            if (sync && !this.fsmCaller.isRunningOnFSMThread()) {
+                ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), done, new Status(RaftError.EACCES,
+                    "trigger snapshot synchronously out of StateMachine's callback methods"));
+                throw new IllegalStateException(
+                    "You can't trigger snapshot synchronously out of StateMachine's callback methods.");
+
+            }
             if (this.downloadingSnapshot.get() != null) {
-                Utils.runClosureInThread(done, new Status(RaftError.EBUSY, "Is loading another snapshot."));
+                ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), done, new Status(RaftError.EBUSY,
+                    "Is loading another snapshot."));
                 return;
             }
 
             if (this.savingSnapshot) {
-                Utils.runClosureInThread(done, new Status(RaftError.EBUSY, "Is saving another snapshot."));
+                ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), done, new Status(RaftError.EBUSY,
+                    "Is saving another snapshot."));
                 return;
             }
 
@@ -324,7 +349,7 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
                 doUnlock = false;
                 this.lock.unlock();
                 this.logManager.clearBufferedLogs();
-                Utils.runClosureInThread(done);
+                ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), done);
                 return;
             }
 
@@ -339,21 +364,32 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
                 }
                 doUnlock = false;
                 this.lock.unlock();
-                Utils.runClosureInThread(done);
+                ThreadPoolsFactory
+                    .runClosureInThread(
+                        getNode().getGroupId(),
+                        done,
+                        new Status(RaftError.ECANCELED,
+                            "The snapshot index distance since last snapshot is less than NodeOptions#snapshotLogIndexMargin, canceled this task."));
                 return;
             }
 
             final SnapshotWriter writer = this.snapshotStorage.create();
             if (writer == null) {
-                Utils.runClosureInThread(done, new Status(RaftError.EIO, "Fail to create writer."));
+                ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), done, new Status(RaftError.EIO,
+                    "Fail to create writer."));
                 reportError(RaftError.EIO.getNumber(), "Fail to create snapshot writer.");
                 return;
             }
             this.savingSnapshot = true;
             final SaveSnapshotDone saveSnapshotDone = new SaveSnapshotDone(writer, done, null);
-            if (!this.fsmCaller.onSnapshotSave(saveSnapshotDone)) {
-                Utils.runClosureInThread(done, new Status(RaftError.EHOSTDOWN, "The raft node is down."));
-                return;
+            if (sync) {
+                this.fsmCaller.onSnapshotSaveSync(saveSnapshotDone);
+            } else {
+                if (!this.fsmCaller.onSnapshotSave(saveSnapshotDone)) {
+                    ThreadPoolsFactory.runClosureInThread(getNode().getGroupId(), done, new Status(RaftError.EHOSTDOWN,
+                        "The raft node is down."));
+                    return;
+                }
             }
             this.runningJobs.incrementAndGet();
         } finally {
@@ -666,6 +702,7 @@ public class SnapshotExecutorImpl implements SnapshotExecutor {
         copierOpts.setRaftClientService(this.node.getRpcService());
         copierOpts.setTimerManager(this.node.getTimerManager());
         copierOpts.setRaftOptions(this.node.getRaftOptions());
+        copierOpts.setGroupId(this.node.getGroupId());
         return copierOpts;
     }
 

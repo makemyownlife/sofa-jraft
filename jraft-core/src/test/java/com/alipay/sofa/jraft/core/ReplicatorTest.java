@@ -69,21 +69,22 @@ import static org.mockito.Matchers.same;
 @RunWith(value = MockitoJUnitRunner.class)
 public class ReplicatorTest {
 
-    private ThreadId          id;
-    private final RaftOptions raftOptions = new RaftOptions();
-    private TimerManager      timerManager;
+    private static final String GROUP_ID    = "test";
+    private ThreadId            id;
+    private final RaftOptions   raftOptions = new RaftOptions();
+    private TimerManager        timerManager;
     @Mock
-    private RaftClientService rpcService;
+    private RaftClientService   rpcService;
     @Mock
-    private NodeImpl          node;
+    private NodeImpl            node;
     @Mock
-    private BallotBox         ballotBox;
+    private BallotBox           ballotBox;
     @Mock
-    private LogManager        logManager;
+    private LogManager          logManager;
     @Mock
-    private SnapshotStorage   snapshotStorage;
-    private ReplicatorOptions opts;
-    private final PeerId      peerId      = new PeerId("localhost", 8081);
+    private SnapshotStorage     snapshotStorage;
+    private ReplicatorOptions   opts;
+    private final PeerId        peerId      = new PeerId("localhost", 8081);
 
     @Before
     public void setup() {
@@ -92,7 +93,7 @@ public class ReplicatorTest {
         this.opts.setRaftRpcService(this.rpcService);
         this.opts.setPeerId(this.peerId);
         this.opts.setBallotBox(this.ballotBox);
-        this.opts.setGroupId("test");
+        this.opts.setGroupId(GROUP_ID);
         this.opts.setTerm(1);
         this.opts.setServerId(new PeerId("localhost", 8082));
         this.opts.setNode(this.node);
@@ -169,7 +170,7 @@ public class ReplicatorTest {
         assertNotNull(r);
         assertSame(r.getOpts(), this.opts);
         Set<String> metrics = this.opts.getNode().getNodeMetrics().getMetricRegistry().getNames();
-        assertEquals(7, metrics.size());
+        assertEquals(12, metrics.size());
         r.destroy();
         metrics = this.opts.getNode().getNodeMetrics().getMetricRegistry().getNames();
         assertEquals(0, metrics.size());
@@ -247,8 +248,9 @@ public class ReplicatorTest {
             Utils.monotonicMs());
         Mockito.verify(this.node).increaseTermTo(
             2,
-            new Status(RaftError.EHIGHERTERMRESPONSE, "Leader receives higher term heartbeat_response from peer:%s",
-                this.peerId));
+            new Status(RaftError.EHIGHERTERMRESPONSE,
+                "Leader receives higher term heartbeat_response from peer:%s, group:%s", this.peerId, this.node
+                    .getGroupId()));
         assertNull(r.id);
     }
 
@@ -344,7 +346,7 @@ public class ReplicatorTest {
         Mockito.when(this.logManager.wait(eq(10L), Mockito.any(), same(this.id))).thenReturn(99L);
 
         final CountDownLatch latch = new CountDownLatch(1);
-        Replicator.waitForCaughtUp(this.id, 1, System.currentTimeMillis() + 5000, new CatchUpClosure() {
+        Replicator.waitForCaughtUp(GROUP_ID, this.id, 1, System.currentTimeMillis() + 5000, new CatchUpClosure() {
 
             @Override
             public void run(final Status status) {
@@ -503,8 +505,9 @@ public class ReplicatorTest {
         Replicator.onHeartbeatReturned(this.id, Status.OK(), request, response, Utils.monotonicMs());
         Mockito.verify(this.node).increaseTermTo(
             2,
-            new Status(RaftError.EHIGHERTERMRESPONSE, "Leader receives higher term heartbeat_response from peer:%s",
-                this.peerId));
+            new Status(RaftError.EHIGHERTERMRESPONSE,
+                "Leader receives higher term heartbeat_response from peer:%s, group:%s", this.peerId, this.node
+                    .getGroupId()));
         assertNull(r.id);
     }
 
@@ -673,8 +676,9 @@ public class ReplicatorTest {
         Replicator.onTimeoutNowReturned(this.id, Status.OK(), request, response, false);
         Mockito.verify(this.node).increaseTermTo(
             12,
-            new Status(RaftError.EHIGHERTERMRESPONSE, "Leader receives higher term timeout_now_response from peer:%s",
-                this.peerId));
+            new Status(RaftError.EHIGHERTERMRESPONSE,
+                "Leader receives higher term timeout_now_response from peer:%s, group:%s", this.peerId, this.node
+                    .getGroupId()));
         assertNull(r.id);
     }
 

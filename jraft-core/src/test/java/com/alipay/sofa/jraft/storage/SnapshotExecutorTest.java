@@ -21,8 +21,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import com.alipay.sofa.jraft.error.RaftError;
-import com.alipay.sofa.jraft.test.MockAsyncContext;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -32,6 +30,7 @@ import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.stubbing.Answer;
 
 import com.alipay.sofa.jraft.FSMCaller;
 import com.alipay.sofa.jraft.Status;
@@ -43,6 +42,7 @@ import com.alipay.sofa.jraft.core.NodeImpl;
 import com.alipay.sofa.jraft.core.TimerManager;
 import com.alipay.sofa.jraft.entity.LocalFileMetaOutter;
 import com.alipay.sofa.jraft.entity.RaftOutter;
+import com.alipay.sofa.jraft.error.RaftError;
 import com.alipay.sofa.jraft.option.CopyOptions;
 import com.alipay.sofa.jraft.option.NodeOptions;
 import com.alipay.sofa.jraft.option.RaftOptions;
@@ -60,11 +60,11 @@ import com.alipay.sofa.jraft.storage.snapshot.local.LocalSnapshotMetaTable;
 import com.alipay.sofa.jraft.storage.snapshot.local.LocalSnapshotReader;
 import com.alipay.sofa.jraft.storage.snapshot.local.LocalSnapshotStorage;
 import com.alipay.sofa.jraft.storage.snapshot.local.LocalSnapshotWriter;
+import com.alipay.sofa.jraft.test.MockAsyncContext;
+import com.alipay.sofa.jraft.test.TestUtils;
 import com.alipay.sofa.jraft.util.Endpoint;
-import com.alipay.sofa.jraft.util.Utils;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
-import org.mockito.stubbing.Answer;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -73,6 +73,7 @@ import static org.mockito.Matchers.eq;
 
 @RunWith(value = MockitoJUnitRunner.class)
 public class SnapshotExecutorTest extends BaseStorageTest {
+    private static final String    GROUP_ID = "group001";
     private SnapshotExecutorImpl   executor;
     @Mock
     private NodeImpl               node;
@@ -117,18 +118,22 @@ public class SnapshotExecutorTest extends BaseStorageTest {
         this.uri = "remote://" + this.hostPort + "/" + this.readerId;
         this.copyOpts = new CopyOptions();
 
-        Mockito.when(this.node.getRaftOptions()).thenReturn(new RaftOptions());
-        Mockito.when(this.node.getOptions()).thenReturn(new NodeOptions());
+        NodeOptions nodeOptions = new NodeOptions();
+        nodeOptions.setSnapshotUri(this.path);
+        Mockito.when(this.node.getGroupId()).thenReturn(GROUP_ID);
+        Mockito.when(this.node.getRaftOptions()).thenReturn(this.raftOptions);
+        Mockito.when(this.node.getOptions()).thenReturn(nodeOptions);
         Mockito.when(this.node.getRpcService()).thenReturn(this.raftClientService);
         Mockito.when(this.node.getTimerManager()).thenReturn(this.timerManager);
         Mockito.when(this.node.getServiceFactory()).thenReturn(DefaultJRaftServiceFactory.newInstance());
+
         this.executor = new SnapshotExecutorImpl();
         final SnapshotExecutorOptions opts = new SnapshotExecutorOptions();
         opts.setFsmCaller(this.fSMCaller);
         opts.setInitTerm(0);
         opts.setNode(this.node);
         opts.setLogManager(this.logManager);
-        opts.setUri(this.path);
+
         this.addr = new Endpoint("localhost", 8081);
         opts.setAddr(this.addr);
         assertTrue(this.executor.init(opts));
@@ -184,23 +189,15 @@ public class SnapshotExecutorTest extends BaseStorageTest {
 
         final MockAsyncContext installContext = new MockAsyncContext();
         final MockAsyncContext retryInstallContext = new MockAsyncContext();
-        Utils.runInThread(new Runnable() {
-            @Override
-            public void run() {
-                SnapshotExecutorTest.this.executor.installSnapshot(irb.build(),
-                    RpcRequests.InstallSnapshotResponse.newBuilder(), new RpcRequestClosure(installContext));
-            }
-        });
+        TestUtils.runInThread(() -> SnapshotExecutorTest.this.executor.installSnapshot(irb.build(),
+            RpcRequests.InstallSnapshotResponse.newBuilder(), new RpcRequestClosure(installContext)));
 
         Thread.sleep(500);
         retryLatch.await();
-        Utils.runInThread(new Runnable() {
-            @Override
-            public void run() {
-                answerLatch.countDown();
-                SnapshotExecutorTest.this.executor.installSnapshot(irb.build(),
-                    RpcRequests.InstallSnapshotResponse.newBuilder(), new RpcRequestClosure(retryInstallContext));
-            }
+        TestUtils.runInThread(() -> {
+            answerLatch.countDown();
+            SnapshotExecutorTest.this.executor.installSnapshot(irb.build(),
+                RpcRequests.InstallSnapshotResponse.newBuilder(), new RpcRequestClosure(retryInstallContext));
         });
 
         RpcResponseClosure<RpcRequests.GetFileResponse> closure = argument.getValue();
@@ -264,7 +261,7 @@ public class SnapshotExecutorTest extends BaseStorageTest {
         Mockito.when(
             this.raftClientService.getFile(eq(new Endpoint("localhost", 8080)), eq(rb.build()),
                 eq(this.copyOpts.getTimeoutMs()), argument.capture())).thenReturn(future);
-        Utils.runInThread(new Runnable() {
+        TestUtils.runInThread(new Runnable() {
 
             @Override
             public void run() {
@@ -332,7 +329,7 @@ public class SnapshotExecutorTest extends BaseStorageTest {
         Mockito.when(
             this.raftClientService.getFile(eq(new Endpoint("localhost", 8080)), eq(rb.build()),
                 eq(this.copyOpts.getTimeoutMs()), argument.capture())).thenReturn(future);
-        Utils.runInThread(new Runnable() {
+        TestUtils.runInThread(new Runnable() {
 
             @Override
             public void run() {
@@ -365,6 +362,37 @@ public class SnapshotExecutorTest extends BaseStorageTest {
         assertTrue(done.getStatus().isOk());
         assertEquals(1, this.executor.getLastSnapshotTerm());
         assertEquals(2, this.executor.getLastSnapshotIndex());
+    }
+
+    @Test
+    public void testDoSnapshotSync() throws Exception {
+        Mockito.when(this.fSMCaller.getLastAppliedIndex()).thenReturn(1L);
+        final ArgumentCaptor<SaveSnapshotClosure> saveSnapshotClosureArg = ArgumentCaptor
+            .forClass(SaveSnapshotClosure.class);
+        Mockito.when(fSMCaller.isRunningOnFSMThread()).thenReturn(true);
+        Mockito.doNothing().when(fSMCaller).onSnapshotSaveSync(saveSnapshotClosureArg.capture());
+        final SynchronizedClosure done = new SynchronizedClosure();
+        this.executor.doSnapshotSync(done);
+        final SaveSnapshotClosure closure = saveSnapshotClosureArg.getValue();
+        assertNotNull(closure);
+        closure.start(RaftOutter.SnapshotMeta.newBuilder().setLastIncludedIndex(2).setLastIncludedTerm(1).build());
+        closure.run(Status.OK());
+        done.await();
+        this.executor.join();
+        assertTrue(done.getStatus().isOk());
+        assertEquals(1, this.executor.getLastSnapshotTerm());
+        assertEquals(2, this.executor.getLastSnapshotIndex());
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void testDoSnapshotSyncIllegalState() throws Exception {
+        Mockito.when(this.fSMCaller.getLastAppliedIndex()).thenReturn(1L);
+        final ArgumentCaptor<SaveSnapshotClosure> saveSnapshotClosureArg = ArgumentCaptor
+            .forClass(SaveSnapshotClosure.class);
+        Mockito.when(fSMCaller.isRunningOnFSMThread()).thenReturn(false);
+        Mockito.doNothing().when(fSMCaller).onSnapshotSaveSync(saveSnapshotClosureArg.capture());
+        final SynchronizedClosure done = new SynchronizedClosure();
+        this.executor.doSnapshotSync(done);
     }
 
     @Test

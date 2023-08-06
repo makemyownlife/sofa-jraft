@@ -33,6 +33,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.alipay.sofa.jraft.util.ThreadPoolsFactory;
+import com.codahale.metrics.MetricRegistry;
 import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -46,6 +48,7 @@ import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.alipay.sofa.jraft.Closure;
 import com.alipay.sofa.jraft.Iterator;
 import com.alipay.sofa.jraft.JRaftUtils;
 import com.alipay.sofa.jraft.Node;
@@ -59,6 +62,7 @@ import com.alipay.sofa.jraft.closure.SynchronizedClosure;
 import com.alipay.sofa.jraft.closure.TaskClosure;
 import com.alipay.sofa.jraft.conf.Configuration;
 import com.alipay.sofa.jraft.entity.EnumOutter;
+import com.alipay.sofa.jraft.entity.LogId;
 import com.alipay.sofa.jraft.entity.PeerId;
 import com.alipay.sofa.jraft.entity.Task;
 import com.alipay.sofa.jraft.entity.UserLog;
@@ -74,9 +78,11 @@ import com.alipay.sofa.jraft.rpc.RpcServer;
 import com.alipay.sofa.jraft.storage.SnapshotThrottle;
 import com.alipay.sofa.jraft.storage.impl.RocksDBLogStorage;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotReader;
+import com.alipay.sofa.jraft.storage.snapshot.SnapshotWriter;
 import com.alipay.sofa.jraft.storage.snapshot.ThroughputSnapshotThrottle;
 import com.alipay.sofa.jraft.test.TestUtils;
 import com.alipay.sofa.jraft.util.Bits;
+import com.alipay.sofa.jraft.util.CountDownEvent;
 import com.alipay.sofa.jraft.util.Endpoint;
 import com.alipay.sofa.jraft.util.StorageOptionsFactory;
 import com.alipay.sofa.jraft.util.Utils;
@@ -95,6 +101,7 @@ import static org.junit.Assert.fail;
 public class NodeTest {
 
     static final Logger         LOG            = LoggerFactory.getLogger(NodeTest.class);
+    public static final String  GROUP_ID       = "test";
 
     private String              dataPath;
 
@@ -129,7 +136,7 @@ public class NodeTest {
 
     @BeforeClass
     public static void setupNodeTest() {
-        StorageOptionsFactory.registerRocksDBTableFormatConfig(RocksDBLogStorage.class, StorageOptionsFactory
+        StorageOptionsFactory.registerRocksDBTableFormatConfig(GROUP_ID, RocksDBLogStorage.class, StorageOptionsFactory
             .getDefaultRocksDBTableConfig().setBlockCacheSize(256 * SizeUnit.MB));
         dumpThread = new DumpThread();
         dumpThread.setName("NodeTest-DumpThread");
@@ -589,10 +596,18 @@ public class NodeTest {
 
         // get leader
         final Node leader = cluster.getLeader();
+        assertEquals(1, leader.getLastAppliedLogIndex());
+        assertEquals(1, leader.getLastCommittedIndex());
+        assertEquals(1, leader.getLastLogIndex());
         assertNotNull(leader);
         assertEquals(3, leader.listPeers().size());
         // apply tasks to leader
         this.sendTestTaskAndWait(leader);
+
+        assertEquals(11, leader.getLastCommittedIndex());
+        assertEquals(11, leader.getLastLogIndex());
+        Thread.sleep(500);
+        assertEquals(11, leader.getLastAppliedLogIndex());
 
         {
             final ByteBuffer data = ByteBuffer.wrap("no closure".getBytes());
@@ -626,8 +641,18 @@ public class NodeTest {
             assertEquals("apply", cbs.get(1));
         }
 
+        assertEquals(13, leader.getLastCommittedIndex());
+        assertEquals(13, leader.getLastLogIndex());
+        Thread.sleep(500);
+        assertEquals(13, leader.getLastAppliedLogIndex());
+
         cluster.ensureSame(-1);
         assertEquals(2, cluster.getFollowers().size());
+        for (Node follower : cluster.getFollowers()) {
+            assertEquals(13, follower.getLastCommittedIndex());
+            assertEquals(13, follower.getLastLogIndex());
+            assertEquals(13, follower.getLastAppliedLogIndex());
+        }
         cluster.stopAll();
     }
 
@@ -2382,6 +2407,97 @@ public class NodeTest {
     }
 
     @Test
+    public void testSnapshotSync() throws Exception {
+        final Endpoint addr = new Endpoint(TestUtils.getMyIp(), TestUtils.INIT_PORT);
+        NodeManager.getInstance().addAddress(addr);
+        final Node node = new NodeImpl("unittest", new PeerId(addr, 0));
+        final NodeOptions nodeOptions = createNodeOptionsWithSharedTimer();
+        nodeOptions.setSnapshotIntervalSecs(3600);
+        final List<LogId> logs = Collections.synchronizedList(new ArrayList<LogId>());
+        final List<LogId> snapshotsExpected = Collections.synchronizedList(new ArrayList<LogId>());
+        final List<LogId> snapshots = Collections.synchronizedList(new ArrayList<LogId>());
+        final CountDownEvent running = new CountDownEvent();
+        final StateMachine fsm = new StateMachineAdapter() {
+
+            @Override
+            public void onApply(Iterator iter) {
+                while (iter.hasNext()) {
+                    final LogId logId = new LogId(iter.getIndex(), iter.getTerm());
+                    logs.add(logId);
+                    //random snapshot
+                    if (ThreadLocalRandom.current().nextInt(10) < 5) {
+                        // commit before do snapshot
+                        iter.commit();
+                        running.incrementAndGet();
+                        node.snapshotSync(new Closure() {
+
+                            @Override
+                            public void run(Status status) {
+                                if (status.isOk()) {
+                                    snapshotsExpected.add(logId.copy());
+                                } else {
+                                    assertEquals(status.getCode(), RaftError.EBUSY.getNumber());
+                                }
+                                running.countDown();
+
+                            }
+                        });
+                    }
+                    iter.done().run(Status.OK());
+                    iter.next();
+                }
+
+            }
+
+            @Override
+            public void onSnapshotSave(SnapshotWriter writer, Closure done) {
+                snapshots.add(new LogId(writer.getCurrentMeta().getLastIncludedIndex(), writer.getCurrentMeta()
+                    .getLastIncludedTerm()));
+                done.run(Status.OK());
+            }
+
+        };
+        nodeOptions.setFsm(fsm);
+        nodeOptions.setLogUri(this.dataPath + File.separator + "log");
+        nodeOptions.setSnapshotUri(this.dataPath + File.separator + "snapshot");
+        nodeOptions.setRaftMetaUri(this.dataPath + File.separator + "meta");
+        nodeOptions.setSnapshotIntervalSecs(10);
+        nodeOptions.setInitialConf(new Configuration(Collections.singletonList(new PeerId(addr, 0))));
+
+        assertTrue(node.init(nodeOptions));
+        // wait node elect self as leader
+        Thread.sleep(2000);
+
+        CountDownLatch latch = new CountDownLatch(1000);
+        for (int i = 0; i < 1000; i++) {
+            final ByteBuffer data = ByteBuffer.wrap(("hello" + i).getBytes());
+            final Task task = new Task(data, new ExpectClosure(0, null, latch));
+            node.apply(task);
+            if (i % 10 == 0) {
+                try {
+                    node.snapshotSync(null);
+                    fail();
+                } catch (IllegalStateException e) {
+
+                }
+            }
+        }
+        waitLatch(latch);
+
+        running.await();
+
+        assertEquals(1000, logs.size());
+        assertTrue(snapshotsExpected.size() > 1);
+        //The metadata should be the same.
+        assertEquals(snapshotsExpected, snapshots);
+
+        latch = new CountDownLatch(1);
+        node.shutdown(new ExpectClosure(latch));
+        node.join();
+        waitLatch(latch);
+    }
+
+    @Test
     public void testLeaderShouldNotChange() throws Exception {
         final List<PeerId> peers = TestUtils.generatePeers(3);
 
@@ -2978,6 +3094,7 @@ public class NodeTest {
         opts.setSnapshotUri(this.dataPath + File.separator + "snapshot");
         opts.setGroupConf(JRaftUtils.getConfiguration("127.0.0.1:5006"));
         opts.setFsm(fsm);
+        opts.setGroupId(GROUP_ID);
 
         NodeManager.getInstance().addAddress(addr);
         assertTrue(JRaftUtils.bootstrap(opts));
@@ -2988,7 +3105,7 @@ public class NodeTest {
         nodeOpts.setSnapshotUri(this.dataPath + File.separator + "snapshot");
         nodeOpts.setFsm(fsm);
 
-        final NodeImpl node = new NodeImpl("test", new PeerId(addr, 0));
+        final NodeImpl node = new NodeImpl(GROUP_ID, new PeerId(addr, 0));
         assertTrue(node.init(nodeOpts));
         assertEquals(26, fsm.getLogs().size());
 
@@ -3017,6 +3134,7 @@ public class NodeTest {
         opts.setSnapshotUri(this.dataPath + File.separator + "snapshot");
         opts.setGroupConf(JRaftUtils.getConfiguration("127.0.0.1:5006"));
         opts.setFsm(fsm);
+        opts.setGroupId(GROUP_ID);
 
         NodeManager.getInstance().addAddress(addr);
         assertTrue(JRaftUtils.bootstrap(opts));
@@ -3027,7 +3145,7 @@ public class NodeTest {
         nodeOpts.setSnapshotUri(this.dataPath + File.separator + "snapshot");
         nodeOpts.setFsm(fsm);
 
-        final NodeImpl node = new NodeImpl("test", new PeerId(addr, 0));
+        final NodeImpl node = new NodeImpl(GROUP_ID, new PeerId(addr, 0));
         assertTrue(node.init(nodeOpts));
         while (!node.isLeader()) {
             Thread.sleep(20);
@@ -3200,7 +3318,7 @@ public class NodeTest {
         expectedErrors.add(RaftError.EPERM);
         expectedErrors.add(RaftError.ECATCHUP);
 
-        return Utils.runInThread(() -> {
+        return TestUtils.runInThread(() -> {
             try {
                 while (!arg.stop) {
                     arg.c.waitLeader();
@@ -3227,7 +3345,7 @@ public class NodeTest {
                     leader.changePeers(conf, done);
                     done.await();
                     assertTrue(done.getStatus().toString(),
-                        done.getStatus().isOk() || expectedErrors.contains(done.getStatus().getRaftError()));
+                            done.getStatus().isOk() || expectedErrors.contains(done.getStatus().getRaftError()));
                 }
             } catch (final InterruptedException e) {
                 LOG.error("ChangePeersThread is interrupted", e);
@@ -3331,10 +3449,11 @@ public class NodeTest {
         final SynchronizedClosure done = new SynchronizedClosure();
         final Node leader = cluster.getLeader();
         leader.changePeers(new Configuration(peers), done);
-        assertTrue(done.await().isOk());
-        cluster.ensureSame();
-        assertEquals(10, cluster.getFsms().size());
         try {
+            Status status = done.await();
+            assertTrue(status.getErrorMsg(), status.isOk());
+            cluster.ensureSame();
+            assertEquals(10, cluster.getFsms().size());
             for (final MockStateMachine fsm : cluster.getFsms()) {
                 final int logSize = fsm.getLogs().size();
                 assertTrue("logSize=" + logSize, logSize >= tasks);
@@ -3367,7 +3486,7 @@ public class NodeTest {
             args.add(arg);
             futures.add(startChangePeersThread(arg));
 
-            Utils.runInThread(() -> {
+            TestUtils.runInThread(() -> {
                 try {
                     for (int i = 0; i < 5000;) {
                         cluster.waitLeader();
@@ -3407,10 +3526,11 @@ public class NodeTest {
         final SynchronizedClosure done = new SynchronizedClosure();
         final Node leader = cluster.getLeader();
         leader.changePeers(new Configuration(peers), done);
-        assertTrue(done.await().isOk());
-        cluster.ensureSame();
-        assertEquals(10, cluster.getFsms().size());
         try {
+        	 Status status = done.await();
+     	     assertTrue(status.getErrorMsg(), status.isOk());
+             cluster.ensureSame();
+             assertEquals(10, cluster.getFsms().size());
             for (final MockStateMachine fsm : cluster.getFsms()) {
                 final int logSize = fsm.getLogs().size();
                 assertTrue("logSize= " + logSize, logSize >= 5000 * threads);
