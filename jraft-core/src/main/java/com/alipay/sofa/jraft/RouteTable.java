@@ -86,11 +86,7 @@ public class RouteTable implements Describer {
     private GroupConf getOrCreateGroupConf(final String groupId) {
         GroupConf gc = this.groupConfTable.get(groupId);
         if (gc == null) {
-            gc = new GroupConf();
-            final GroupConf old = this.groupConfTable.putIfAbsent(groupId, gc);
-            if (old != null) {
-                gc = old;
-            }
+            return this.groupConfTable.computeIfAbsent(groupId, key -> new GroupConf());
         }
         return gc;
     }
@@ -320,6 +316,11 @@ public class RouteTable implements Describer {
                     final PeerId newPeer = new PeerId();
                     newPeer.parse(peerIdStr);
                     newConf.addPeer(newPeer);
+                }
+                for (final String learnerIdStr : resp.getLearnersList()) {
+                    final PeerId newLearner = new PeerId();
+                    newLearner.parse(learnerIdStr);
+                    newConf.addLearner(newLearner);
                 }
                 if (!conf.equals(newConf)) {
                     LOG.info("Configuration of replication group {} changed from {} to {}", groupId, conf, newConf);
